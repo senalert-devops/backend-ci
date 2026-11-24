@@ -1,0 +1,131 @@
+# Pipeline CI du backend SenAlert : tester, construire l'image, la publier sur Docker Hub,
+# puis déclencher le déploiement (dépôt deployment-cd).
+#
+# Valeurs utilisées (créées à l'étape 3 du guide, au niveau de l'organisation) :
+#   variable DOCKERHUB_USER   : compte Docker Hub de l'équipe (un secret du même nom est aussi accepté)
+#   secret   DOCKERHUB_TOKEN  : jeton d'accès Docker Hub (Read & Write)
+#   secret   CD_TRIGGER_TOKEN : jeton GitHub (portée repo) pour lancer deployment-cd
+# Aucune valeur n'est écrite dans ce fichier.
+name: CI - Backend
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Tests unitaires (SQLite : aucune base externe nécessaire)
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Installer les dépendances
+        run: pip install -r requirements-dev.txt
+
+      - name: Lancer pytest
+        run: python -m pytest -v
+
+  # 2. Image Docker : construite et vérifiée à chaque exécution,
+  #    publiée sur Docker Hub seulement depuis main.
+  image:
+    name: Image Docker
+    needs: tests
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USER: ${{ vars.DOCKERHUB_USER || secrets.DOCKERHUB_USER }}
+      IMAGE_NAME: senalert-backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Vérifier que la configuration Docker Hub est présente
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          test -n "$DOCKERHUB_USER" || { echo "::error::DOCKERHUB_USER absent : à créer dans Organisation > Settings > Secrets and variables > Actions > Variables, avec accès au dépôt backend-ci"; exit 1; }
+          test -n "$DOCKERHUB_TOKEN" || { echo "::error::Secret DOCKERHUB_TOKEN absent ou non partagé avec le dépôt backend-ci"; exit 1; }
+
+      - name: Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construire l'image (sans la publier)
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Test de démarrage : l'image doit répondre sur /health avec une configuration complète
+      # (valeurs temporaires générées pour ce test uniquement, SQLite dans le conteneur).
+      - name: Vérifier que le conteneur démarre et répond
+        run: |
+          docker run -d --name backend-test -p 8000:8000 \
+            -e DATABASE_URL="sqlite:////tmp/test.db" \
+            -e ADMIN_USER="admin-ci" \
+            -e ADMIN_PASSWORD="$(openssl rand -hex 16)" \
+            -e CORS_ORIGINS="http://localhost:3000" \
+            "$IMAGE_NAME:ci"
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8000/health; then echo; exit 0; fi
+            sleep 2
+          done
+          docker logs backend-test
+          exit 1
+
+      - name: Connexion à Docker Hub
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: "Publier l'image sur Docker Hub (latest et commit)"
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.DOCKERHUB_USER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+
+  # 3. Déploiement : prévient le dépôt deployment-cd, qui redéploie le backend sur Kubernetes
+  declencher-deploiement:
+    name: Déclencher le déploiement
+    needs: image
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Déclencher le déploiement
+        env:
+          CD_TRIGGER_TOKEN: ${{ secrets.CD_TRIGGER_TOKEN }}
+          ORGANISATION: ${{ github.repository_owner }}
+        run: |
+          test -n "$CD_TRIGGER_TOKEN" || { echo "::error::Secret CD_TRIGGER_TOKEN absent ou non partagé avec le dépôt backend-ci"; exit 1; }
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $CD_TRIGGER_TOKEN" \
+            "https://api.github.com/repos/${ORGANISATION}/deployment-cd/dispatches" \
+            -d '{"event_type":"backend-updated"}'
